@@ -1,0 +1,271 @@
+name: Deploy Asset Delivery Infrastructure
+
+on:
+  push:
+    branches:
+      - main
+    # only trigger on changes that can affect infrastructure skips apply runs
+    # for README edits, script tweaks, or anything outside the terraform directory
+    paths:
+      - "terraform/**"
+      - ".github/workflows/deploy.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "terraform/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "prod"
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      destroy:
+        description: "Destroy infrastructure instead of apply"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  id-token: write      # GitHub mints a short-lived OIDC JWT; AWS validates it against the registered provider no stored credentials
+  contents: read
+  pull-requests: write # post the plan output as a PR comment before anything merges
+
+env:
+  TF_VERSION: "1.7.5"
+  AWS_REGION: "us-east-1"
+  TF_WORKING_DIR: "./terraform"
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  TF_STATE_KEY: "asset-delivery/terraform.tfstate"
+  TF_STATE_REGION: "us-east-1"
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'prod' }}
+
+jobs:
+  validate:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform fmt -check -recursive
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # backend config is injected at init time so the same Terraform code works across
+      # dev/staging/prod each environment just points to a different state key
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.TF_STATE_KEY }}" \
+            -backend-config="region=${{ env.TF_STATE_REGION }}"
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+  plan:
+    name: Plan
+    needs: validate
+    runs-on: ubuntu-latest
+    # plan only runs on PRs gives reviewers a rendered diff of what will change
+    # before anything gets merged and applied to the real environment
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.TF_STATE_KEY }}" \
+            -backend-config="region=${{ env.TF_STATE_REGION }}"
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var="environment=${{ env.ENVIRONMENT }}" \
+            -var="cloudwatch_alarm_sns_arn=${{ secrets.ALARM_SNS_ARN || '' }}" \
+            -no-color \
+            -out=tfplan 2>&1 | tee plan_output.txt
+          echo "exitcode=$?" >> $GITHUB_OUTPUT
+
+      - name: Post Plan to PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ env.TF_WORKING_DIR }}/plan_output.txt', 'utf8');
+            const maxLen = 65000;
+            const truncated = plan.length > maxLen
+              ? plan.substring(0, maxLen) + '\n\n... (truncated)'
+              : plan;
+
+            const body = `## Terraform Plan — \`${{ env.ENVIRONMENT }}\`
+            <details><summary>Show Plan</summary>
+
+            \`\`\`hcl
+            ${truncated}
+            \`\`\`
+            </details>`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+  apply:
+    name: Apply
+    needs: validate
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.destroy != 'true')
+    environment: ${{ github.event.inputs.environment || 'prod' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.TF_STATE_KEY }}" \
+            -backend-config="region=${{ env.TF_STATE_REGION }}"
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform apply \
+            -var="environment=${{ env.ENVIRONMENT }}" \
+            -var="cloudwatch_alarm_sns_arn=${{ secrets.ALARM_SNS_ARN || '' }}" \
+            -auto-approve
+
+      - name: Capture Outputs
+        id: tf_outputs
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          echo "distribution_id=$(terraform output -raw cloudfront_distribution_id)" >> $GITHUB_OUTPUT
+          echo "test_url=$(terraform output -raw test_file_url)" >> $GITHUB_OUTPUT
+
+      # invalidate before smoke test so we're testing the freshly deployed content,
+      # not a cached version of whatever was sitting at the edge before this run
+      - name: Invalidate CloudFront Cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ steps.tf_outputs.outputs.distribution_id }} \
+            --paths "/*"
+
+      # CloudFront propagation takes 1-3 minutes after invalidation 18 retries at
+      # 10-second intervals gives a 3-minute window before the job calls it a failure
+      - name: Smoke Test
+        run: |
+          URL="${{ steps.tf_outputs.outputs.test_url }}"
+          echo "Testing $URL ..."
+          for i in $(seq 1 18); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+            echo "  Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then
+              echo "Smoke test passed"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Smoke test failed — $URL did not return 200"
+          exit 1
+
+      - name: Summary
+        run: |
+          echo "### Deployment complete" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| CloudFront Distribution | \`${{ steps.tf_outputs.outputs.distribution_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Test File URL | ${{ steps.tf_outputs.outputs.test_url }} |" >> $GITHUB_STEP_SUMMARY
+
+  destroy:
+    name: Destroy
+    needs: validate
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.destroy == 'true'
+    environment: ${{ github.event.inputs.environment || 'prod' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.TF_STATE_KEY }}" \
+            -backend-config="region=${{ env.TF_STATE_REGION }}"
+
+      - name: Terraform Destroy
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform destroy \
+            -var="environment=${{ env.ENVIRONMENT }}" \
+            -auto-approve
