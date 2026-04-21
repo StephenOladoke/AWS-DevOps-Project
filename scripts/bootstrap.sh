@@ -7,7 +7,7 @@ REGION="us-east-1"
 ROLE_NAME="github-actions-asset-delivery"
 POLICY_NAME="asset-delivery-deploy"
 # OIDC lets GitHub exchange a short-lived JWT for temporary AWS credentials on each run.
-# The alternative storing AWS_ACCESS_KEY_ID in GitHub Secrets  creates static keys that
+# The alternative storing AWS_ACCESS_KEY_ID in GitHub Secrets creates static keys that
 # never expire and need manual rotation. OIDC eliminates that problem entirely.
 OIDC_PROVIDER_URL="https://token.actions.githubusercontent.com"
 
@@ -66,7 +66,7 @@ else
   echo "✓ Created OIDC provider"
 fi
 
-# StringLike with the :* wildcard covers all refs  branches, tags, and PR merge refs.
+# StringLike with the :* wildcard covers all refs branches, tags, and PR merge refs.
 # StringEquals would lock it to a single branch and break workflow_dispatch from other refs.
 TRUST_POLICY=$(cat <<EOF
 {
