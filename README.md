@@ -2,7 +2,7 @@
 
 ## The Task
 
-Provision a private S3 bucket, serve it through CloudFront using Origin Access Control, automate deployments with GitHub Actions, and set up a CloudWatch alarm for 5xx error monitoring. Four days, clean code, don't overthink it.
+Provisioning a private S3 bucket, served it through CloudFront using Origin Access Control for security, automated deployments with GitHub Actions, and set up a CloudWatch alarm for 5xx error monitoring.
 
 ## My Approach
 
@@ -44,7 +44,7 @@ scripts/
 
 **All four public access block flags** I set all of them to true. Belt and suspenders, makes it impossible to accidentally expose the bucket.
 
-**TLS enforced at two layers** I deny non-HTTPS at the S3 bucket policy level in addition to CloudFront redirecting to HTTPS. That way even if someone bypasses CloudFront and hits S3 directly, the request gets rejected.
+**TLS enforced at two layers** I denied non-HTTPS at the S3 bucket policy level in addition to CloudFront redirecting to HTTPS. That way even if someone bypasses CloudFront and hits S3 directly, the request gets rejected.
 
 **TLS 1.2 minimum** I dropped 1.0 and 1.1 at the distribution level. Both are deprecated and shouldn't be negotiated.
 
@@ -73,8 +73,8 @@ Everything deployed cleanly but my smoke test was returning 503 on all retry att
 The actual bug was in my CloudFront security headers function. I had attached it to `viewer-request` but the code was reading `event.response`. On a viewer-request there is no response object, the request hasn't hit the origin yet. My function was throwing a JavaScript error on every incoming request which CloudFront translates to a 503. I moved it to `viewer-response` and it passed immediately.
 
 ## Proof of Life
+https://d19ogve0k33iqc.cloudfront.net/test.txt
 
-https://d1winly936p0qy.cloudfront.net/test.txt
 
 ## How To Deploy
 
